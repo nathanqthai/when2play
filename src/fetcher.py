@@ -7,7 +7,7 @@ import enum
 import logging
 import time
 
-from typing import List, Dict, Union, Optional
+from typing import List, Dict, Union, Optional, Any
 
 import asyncio
 import aiohttp
@@ -49,9 +49,7 @@ class MatchFetcher:
             limiters.append(throttler.Throttler(**limit))
         return limiters
 
-    async def call_api(
-        self, client: aiohttp.ClientSession, endpoint: Endpoint, query: str
-    ) -> Optional[Dict[str, Union[str, int]]]:
+    async def call_api(self, client: aiohttp.ClientSession, endpoint: Endpoint, query: str) -> Any:
         url = f"{self.__base_url}/{endpoint.value}/{query}"
         data = None
         async with contextlib.AsyncExitStack() as stack:
@@ -60,32 +58,46 @@ class MatchFetcher:
             data = await self._request(client, url)
         return data
 
-    async def _request(
-        self, client: aiohttp.ClientSession, url: str
-    ) -> Dict[str, Union[str, int]]:
+    async def _request(self, client: aiohttp.ClientSession, url: str) -> Dict[str, Any]:
+        log.debug(url)
         async with client.get(url) as response:
             return await response.json()
-
-    async def _get_account_id(
-        self, client: aiohttp.ClientSession, username: str
-    ) -> Optional[str]:
-        account_id = None
-        summoner_info = await self.call_api(
-            client, self.Endpoint.SUMMONER, username
-        )
-        if summoner_info:
-            account_id = summoner_info.get("accountId", None)
-        return str(account_id) if account_id else None
 
     async def get_match_history(self, username: str) -> None:
         headers = {"X-Riot-Token": self.api_key}
         async with aiohttp.ClientSession(headers=headers) as client:
-            account_id = await self._get_account_id(client, username)
-            match_history = await self.call_api(
-                client, self.Endpoint.MATCHES, account_id
+            summoner_info = await self.call_api(
+                client, self.Endpoint.SUMMONER, username
             )
-            # get win loss for every match
-            log.debug(match_history)
+            if summoner_info is None:
+                log.error("Failed to get info for summoner: {username}")
+                return None
+
+            account_id = summoner_info.get("accountId")
+            if account_id is None:
+                return None
+
+            match_history = await self.call_api(
+                client, self.Endpoint.MATCHES, str(account_id)
+            )
+            if match_history is None:
+                return None
+
+            tasks = list()
+            for match in match_history.get("matches", []):
+                summoner_id = summoner_info.get("id")
+                game_id = match.get("gameId")
+                coro = self.get_normalize_match(client, summoner_id, game_id)
+                tasks.append(asyncio.ensure_future(coro))
+
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            matches = filter(lambda i: not(isinstance(i, Exception)), results)
+
+
+    async def get_normalize_match(self, client, summoner_id, game_id):
+        match = await self.call_api(client, self.Endpoint.MATCH, game_id)
+        # TODO: correlate win in match with summoner_id
+        return match
 
 
 def parse_args():
